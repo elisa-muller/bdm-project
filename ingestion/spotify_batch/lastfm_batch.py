@@ -33,7 +33,7 @@ countries = [
     "italy", "japan", "south korea", "brazil", "mexico"
 ]
 
-# Last.fm docs show paginated methods with page + limit and default limit 50.
+# Last.fm docs show paginated methods with page + limit and default limit 50
 per_page_limit = 50
 chart_pages = 20
 tag_pages = 20
@@ -192,7 +192,7 @@ raw_path = os.path.join(output_dir, "lastfm_tracks_raw.csv")
 df_raw.to_csv(raw_path, index=False)
 
 # Deduplicate conservatively by artist + track + source_type + source_value
-# so you keep provenance but remove exact duplicates from repeated pages.
+# so we keep provenance but remove exact duplicates from repeated pages.
 df_dedup = df_raw.drop_duplicates(
     subset=["lastfm_artist_name", "lastfm_track_name", "source_type", "source_value"]
 ).reset_index(drop=True)
