@@ -30,15 +30,40 @@ else:
 
 files_to_upload = [
 
-    {
-        "local_path": r"C:\Users\usuario\Desktop\Màster\2nd semester\BDM\Project 1 BDM\bdm-project\ingestion\spotify_batch\data\lastfm_tracks_unique.csv",
-        "object_name": "lastfm/raw/tracks_and_artists/lastfm_tracks_unique.csv"
-    }
+    # Last.fm structured raw data
+    # {
+    #     "local_path": "ingestion/spotify_batch/data/lastfm_tracks_unique.csv",
+    #     "object_name": "temporal/structured/lastfm/raw/lastfm_tracks_unique.csv"
+    # },
 
+    # Spotify structured raw data
+    # Uncomment when the file is available
+    # {
+    #     "local_path": "ingestion/spotify_batch/data/spotify_tracks.csv",
+    #     "object_name": "temporal/structured/spotify/raw/spotify_tracks.csv"
+    # },
+
+    # Spotify artists structured raw data
+    # Uncomment when the file is available
+    # {
+    #     "local_path": "ingestion/spotify_batch/data/spotify_artists.csv",
+    #     "object_name": "temporal/structured/spotify/raw/spotify_artists.csv"
+    # },
+
+    # Mastodon semi-structured raw data
+    # Uncomment when the file is available
+    # {
+    #     "local_path": "ingestion/mastodon_stream/data/mastodon_posts.json",
+    #     "object_name": "temporal/semi_structured/mastodon/raw/mastodon_posts.json"
+    # },
+
+    # Images are intentionally not uploaded at this stage.
+    # According to the current project design, the focus is on making the image
+    # streaming pipeline work. Image labels or aggregates may be stored later in P2.
 ]
 
 # -------------------------
-# UPLOAD CSV FILES
+# UPLOAD FILES
 # -------------------------
 
 for file in files_to_upload:
@@ -58,24 +83,3 @@ for file in files_to_upload:
 
     else:
         print(f"File not found -> {local_path}")
-
-
-# -------------------------
-# UPLOAD IMAGE DATASET
-# -------------------------
-
-images_folder = r"C:\Users\usuario\Desktop\Màster\2nd semester\BDM\Project 1 BDM\valid_samples"
-
-for img in os.listdir(images_folder):
-
-    img_path = os.path.join(images_folder, img)
-
-    if os.path.isfile(img_path):
-
-        object_name = f"images/raw/{img}"
-
-        client.fput_object(
-            bucket_name,
-            object_name,
-            img_path
-        )
