@@ -21,7 +21,6 @@ API_URL = "http://ws.audioscrobbler.com/2.0/"
 output_dir = "data"
 os.makedirs(output_dir, exist_ok=True)
 
-# Broad discovery dimensions
 tags = [
     "pop", "rock", "jazz", "electronic", "classical", "hip-hop", "reggae",
     "indie", "metal", "blues", "folk", "soul", "dance", "ambient",
@@ -33,7 +32,6 @@ countries = [
     "italy", "japan", "south korea", "brazil", "mexico"
 ]
 
-# Last.fm docs show paginated methods with page + limit and default limit 50
 per_page_limit = 50
 chart_pages = 20
 tag_pages = 20
@@ -51,15 +49,12 @@ def call_lastfm(method, extra_params):
         "format": "json",
         **extra_params
     }
-
     response = requests.get(API_URL, params=params, timeout=30)
     response.raise_for_status()
     return response.json()
 
+
 def parse_track_item(track, source_type, source_value, page):
-    """
-    Normalize different Last.fm track payloads into one schema.
-    """
     artist_name = None
     artist_mbid = None
 
@@ -97,67 +92,54 @@ def parse_track_item(track, source_type, source_value, page):
             if isinstance(track.get("@attr"), dict) else None
         ),
         "lastfm_image_url": image_url,
-        "source_type": source_type,     # chart / tag / geo
-        "source_value": source_value,   # e.g. pop / spain / global
+        "source_type": source_type,
+        "source_value": source_value,
         "source_page": page
     }
+
 
 def fetch_chart_tracks(max_pages=20, limit=50):
     rows = []
     for page in range(1, max_pages + 1):
         print(f"[chart] page {page}")
         data = call_lastfm("chart.getTopTracks", {"page": page, "limit": limit})
-
         tracks = data.get("tracks", {}).get("track", [])
         if not tracks:
             break
-
         for track in tracks:
             rows.append(parse_track_item(track, "chart", "global", page))
-
         time.sleep(sleep_seconds)
-
     return rows
+
 
 def fetch_tag_tracks(tag, max_pages=20, limit=50):
     rows = []
     for page in range(1, max_pages + 1):
         print(f"[tag={tag}] page {page}")
-        data = call_lastfm(
-            "tag.getTopTracks",
-            {"tag": tag, "page": page, "limit": limit}
-        )
-
+        data = call_lastfm("tag.getTopTracks", {"tag": tag, "page": page, "limit": limit})
         tracks = data.get("tracks", {}).get("track", [])
         if not tracks:
             break
-
         for track in tracks:
             rows.append(parse_track_item(track, "tag", tag, page))
-
         time.sleep(sleep_seconds)
-
     return rows
+
 
 def fetch_geo_tracks(country, max_pages=20, limit=50):
     rows = []
     for page in range(1, max_pages + 1):
         print(f"[country={country}] page {page}")
-        data = call_lastfm(
-            "geo.getTopTracks",
-            {"country": country, "page": page, "limit": limit}
-        )
-
+        data = call_lastfm("geo.getTopTracks", {"country": country, "page": page, "limit": limit})
         tracks = data.get("tracks", {}).get("track", [])
         if not tracks:
             break
-
         for track in tracks:
             rows.append(parse_track_item(track, "geo", country, page))
-
         time.sleep(sleep_seconds)
-
     return rows
+
+
 
 # -----------------------------
 # Main ingestion
@@ -191,8 +173,6 @@ df_raw = pd.DataFrame(all_rows)
 raw_path = os.path.join(output_dir, "lastfm_tracks_raw.csv")
 df_raw.to_csv(raw_path, index=False)
 
-# Deduplicate conservatively by artist + track + source_type + source_value
-# so we keep provenance but remove exact duplicates from repeated pages.
 df_dedup = df_raw.drop_duplicates(
     subset=["lastfm_artist_name", "lastfm_track_name", "source_type", "source_value"]
 ).reset_index(drop=True)
@@ -200,7 +180,6 @@ df_dedup = df_raw.drop_duplicates(
 dedup_path = os.path.join(output_dir, "lastfm_tracks_dedup.csv")
 df_dedup.to_csv(dedup_path, index=False)
 
-# Also create a canonical unique track table for later Spotify matching
 df_unique_tracks = df_raw.drop_duplicates(
     subset=["lastfm_artist_name", "lastfm_track_name"]
 ).reset_index(drop=True)
@@ -208,10 +187,10 @@ df_unique_tracks = df_raw.drop_duplicates(
 unique_path = os.path.join(output_dir, "lastfm_tracks_unique.csv")
 df_unique_tracks.to_csv(unique_path, index=False)
 
-print(f"\nRaw rows collected: {len(df_raw)}")
-print(f"Deduplicated rows (with provenance kept): {len(df_dedup)}")
-print(f"Unique artist-track pairs: {len(df_unique_tracks)}")
+print(f"\nRaw rows collected:                    {len(df_raw)}")
+print(f"Deduplicated rows (provenance kept):   {len(df_dedup)}")
+print(f"Unique artist-track pairs:             {len(df_unique_tracks)}")
 
-print(f"Saved raw dataset to: {raw_path}")
+print(f"\nSaved raw dataset to:          {raw_path}")
 print(f"Saved deduplicated dataset to: {dedup_path}")
 print(f"Saved unique-track dataset to: {unique_path}")
