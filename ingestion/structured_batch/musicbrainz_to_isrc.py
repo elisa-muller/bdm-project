@@ -1,72 +1,160 @@
-# pip install requests pandas
+# pip install requests pandas python-dotenv deltalake pyarrow minio
 
-import os
+import io
+import re
 import time
-import requests
+from datetime import datetime, timezone
+from typing import Optional, Tuple
+
 import pandas as pd
-from typing import Optional
+import requests
+from deltalake import DeltaTable, write_deltalake
+from minio import Minio
 
 # -----------------------------
-# Configuration
+# MinIO / Delta configuration
+# -----------------------------
+MINIO_ENDPOINT = "localhost:9000"
+MINIO_ACCESS_KEY = "minioadmin"
+MINIO_SECRET_KEY = "minioadmin"
+MINIO_SECURE = False
+MINIO_BUCKET = "lakehouse"
+
+LASTFM_TRACKS_DELTA_URI = "s3://lakehouse/bronze/persistent/lastfm/tracks_delta"
+ISRC_CACHE_DELTA_URI = "s3://lakehouse/bronze/persistent/musicbrainz/isrc_cache_delta"
+
+DELTA_STORAGE_OPTIONS = {
+    "AWS_ACCESS_KEY_ID": MINIO_ACCESS_KEY,
+    "AWS_SECRET_ACCESS_KEY": MINIO_SECRET_KEY,
+    "AWS_REGION": "us-east-1",
+    "AWS_ENDPOINT_URL": f"http://{MINIO_ENDPOINT}",
+    "AWS_ALLOW_HTTP": "true",
+    "AWS_S3_ALLOW_UNSAFE_RENAME": "true",
+}
+
+# -----------------------------
+# MusicBrainz configuration
 # -----------------------------
 MUSICBRAINZ_BASE = "https://musicbrainz.org/ws/2"
-
 MUSICBRAINZ_HEADERS = {
     "User-Agent": "bdm-project/1.0 (student-project; contact: albaqiu03@gmail.com)"
 }
 
-DATA_DIR = "data"
-INPUT_PATH = os.path.join(DATA_DIR, "lastfm_tracks_unique.csv")
-OUTPUT_PATH = os.path.join(DATA_DIR, "musicbrainz_isrc_cache_test.csv")
-
-TEST_MODE = True
-TEST_SIZE = 60
-
-# Keep this conservative for MusicBrainz
 MB_SLEEP = 1.1
 MAX_RETRIES_503 = 3
+CHECKPOINT_EVERY = 50
 
+# Fallback search tuning
+SEARCH_LIMIT = 5
+MIN_SEARCH_SCORE = 85  # heuristic, adjust if needed
+
+run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 # -----------------------------
-# Utility functions
+# MinIO client
+# -----------------------------
+minio_client = Minio(
+    MINIO_ENDPOINT,
+    access_key=MINIO_ACCESS_KEY,
+    secret_key=MINIO_SECRET_KEY,
+    secure=MINIO_SECURE,
+)
+
+# -----------------------------
+# Helpers
 # -----------------------------
 def safe_str(x) -> str:
-    """Safely convert a value to string and strip whitespace."""
     if pd.isna(x):
         return ""
     return str(x).strip()
 
 
+def normalize_text(s: str) -> str:
+    s = safe_str(s).lower()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"[^\w\s]", "", s)
+    return s.strip()
+
+
+def delta_table_exists(delta_uri: str) -> bool:
+    try:
+        DeltaTable(delta_uri, storage_options=DELTA_STORAGE_OPTIONS)
+        return True
+    except Exception:
+        return False
+
+
+def load_delta_as_df(delta_uri: str) -> pd.DataFrame:
+    dt = DeltaTable(delta_uri, storage_options=DELTA_STORAGE_OPTIONS)
+    return dt.to_pandas()
+
+
+def append_to_delta(df: pd.DataFrame, delta_uri: str) -> None:
+    if df.empty:
+        return
+
+    if not delta_table_exists(delta_uri):
+        write_deltalake(
+            delta_uri,
+            df,
+            mode="overwrite",
+            storage_options=DELTA_STORAGE_OPTIONS,
+        )
+        print(f"Created Delta table: {delta_uri}")
+        return
+
+    write_deltalake(
+        delta_uri,
+        df,
+        mode="append",
+        storage_options=DELTA_STORAGE_OPTIONS,
+    )
+    print(f"Appended {len(df)} rows to Delta table: {delta_uri}")
+
+
+def upload_csv_to_minio(df: pd.DataFrame, bucket_name: str, object_name: str) -> None:
+    if df.empty:
+        return
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+    data_stream = io.BytesIO(csv_bytes)
+
+    minio_client.put_object(
+        bucket_name=bucket_name,
+        object_name=object_name,
+        data=data_stream,
+        length=len(csv_bytes),
+        content_type="text/csv",
+    )
+    print(f"Uploaded CSV to s3://{bucket_name}/{object_name}")
+
+
+def export_full_debug_csv_local(delta_uri: str, local_path: str) -> None:
+    if not delta_table_exists(delta_uri):
+        return
+
+    df_check = load_delta_as_df(delta_uri)
+    df_check.to_csv(local_path, index=False)
+    print(f"Debug CSV exported locally: {local_path}")
+
+
 def extract_first_isrc(data: dict) -> Optional[str]:
-    """Extract the first ISRC from a MusicBrainz response."""
     isrcs = data.get("isrcs", [])
     if isinstance(isrcs, list) and len(isrcs) > 0:
         return isrcs[0]
     return None
 
 
-# -----------------------------
-# MusicBrainz resolution method
-# -----------------------------
-def get_isrc_from_mbid(mbid: str, max_retries: int = MAX_RETRIES_503):
+def get_isrc_from_recording_mbid(mbid: str, max_retries: int = MAX_RETRIES_503):
     """
-    Resolve ISRC using a MusicBrainz recording MBID.
-
-    Returns:
-        isrc: resolved ISRC or None
-        status_label: one of
-            - "ok"
-            - "not_found_404"
-            - "rate_limited_503"
-            - "other_http_error"
-            - "request_exception"
-            - "invalid_mbid"
-            - "no_isrc"
+    Direct MusicBrainz lookup:
+    /ws/2/recording/{mbid}?inc=isrcs&fmt=json
     """
     mbid = safe_str(mbid)
 
     if not mbid or len(mbid) < 10:
-        return None, "invalid_mbid"
+        return None, "invalid_mbid", None
 
     for attempt in range(max_retries + 1):
         try:
@@ -80,23 +168,27 @@ def get_isrc_from_mbid(mbid: str, max_retries: int = MAX_RETRIES_503):
             if r.status_code == 200:
                 data = r.json()
                 isrc = extract_first_isrc(data)
+                matched_mbid = safe_str(data.get("id"))
                 if isrc:
-                    return isrc, "ok"
-                return None, "no_isrc"
+                    return isrc, "ok", matched_mbid
+                return None, "no_isrc", matched_mbid
 
             if r.status_code == 503:
                 if attempt < max_retries:
                     wait_time = 2 * (attempt + 1)
-                    print(f"[MBID] status=503 mbid={mbid} | retry {attempt + 1}/{max_retries} in {wait_time}s")
+                    print(
+                        f"[MBID] status=503 mbid={mbid} | "
+                        f"retry {attempt + 1}/{max_retries} in {wait_time}s"
+                    )
                     time.sleep(wait_time)
                     continue
-                return None, "rate_limited_503"
+                return None, "rate_limited_503", None
 
             if r.status_code == 404:
-                return None, "not_found_404"
+                return None, "not_found_404", None
 
             print(f"[MBID] status={r.status_code} mbid={mbid}")
-            return None, "other_http_error"
+            return None, "other_http_error", None
 
         except Exception as e:
             print(f"[MBID] error mbid={mbid}: {e}")
@@ -104,83 +196,226 @@ def get_isrc_from_mbid(mbid: str, max_retries: int = MAX_RETRIES_503):
                 wait_time = 2 * (attempt + 1)
                 time.sleep(wait_time)
                 continue
-            return None, "request_exception"
+            return None, "request_exception", None
 
-    return None, "request_exception"
+    return None, "request_exception", None
 
 
-# -----------------------------
-# Test set builder
-# -----------------------------
-def build_test_set(df_tracks: pd.DataFrame, test_size: int) -> pd.DataFrame:
+def choose_best_search_match(recordings: list, artist: str, track: str) -> Optional[dict]:
     """
-    Build a test set only with tracks that have MBID.
+    Heuristic match selection:
+    1) exact normalized recording + exact normalized artist-credit phrase
+    2) otherwise highest score above threshold
     """
-    df_with_mbid = df_tracks[df_tracks["lastfm_track_mbid"].notna()].copy()
-    df_test = df_with_mbid.head(test_size).reset_index(drop=True)
-    return df_test
+    if not recordings:
+        return None
+
+    target_artist = normalize_text(artist)
+    target_track = normalize_text(track)
+
+    # Exact-ish pass
+    for rec in recordings:
+        rec_title = normalize_text(rec.get("title"))
+        if rec_title != target_track:
+            continue
+
+        artist_credit = rec.get("artist-credit", [])
+        credit_names = []
+        for item in artist_credit:
+            if isinstance(item, dict):
+                name = item.get("name") or item.get("artist", {}).get("name")
+                if name:
+                    credit_names.append(name)
+
+        rec_artist = normalize_text(" ".join(credit_names))
+        if target_artist and target_artist in rec_artist:
+            return rec
+
+    # Score-based fallback
+    best = None
+    best_score = -1
+    for rec in recordings:
+        try:
+            score = int(rec.get("score", 0))
+        except Exception:
+            score = 0
+        if score > best_score:
+            best = rec
+            best_score = score
+
+    if best is not None and best_score >= MIN_SEARCH_SCORE:
+        return best
+
+    return None
 
 
-# -----------------------------
-# Main pipeline
-# -----------------------------
-def main():
-    print(f"Loading input: {INPUT_PATH}")
-    df_tracks = pd.read_csv(INPUT_PATH)
+def search_recording_and_get_isrc(
+    artist: str,
+    track: str,
+    max_retries: int = MAX_RETRIES_503,
+) -> Tuple[Optional[str], str, Optional[str], Optional[int]]:
+    """
+    MusicBrainz search fallback:
+    /ws/2/recording?query=recording:"..." AND artist:"..."&fmt=json
+    Then inspect best match and extract first ISRC.
+    """
+    artist = safe_str(artist)
+    track = safe_str(track)
 
-    # Keep only tracks with MBID
-    df_tracks = df_tracks[df_tracks["lastfm_track_mbid"].notna()].copy()
-    print(f"After filtering MBID: {len(df_tracks)} rows")
+    if not artist or not track:
+        return None, "search_no_match", None, None
 
-    # Optional: remove duplicate artist-track-MBID rows before processing
-    df_tracks = df_tracks.drop_duplicates(
-        subset=["lastfm_artist_name", "lastfm_track_name", "lastfm_track_mbid"]
+    query = f'recording:"{track}" AND artist:"{artist}"'
+
+    for attempt in range(max_retries + 1):
+        try:
+            r = requests.get(
+                f"{MUSICBRAINZ_BASE}/recording",
+                params={
+                    "query": query,
+                    "fmt": "json",
+                    "limit": SEARCH_LIMIT,
+                },
+                headers=MUSICBRAINZ_HEADERS,
+                timeout=20,
+            )
+
+            if r.status_code == 200:
+                data = r.json()
+                recordings = data.get("recordings", [])
+                best = choose_best_search_match(recordings, artist, track)
+
+                if not best:
+                    return None, "search_no_match", None, None
+
+                matched_mbid = safe_str(best.get("id"))
+                score = int(best.get("score", 0)) if safe_str(best.get("score")) else None
+                isrc = extract_first_isrc(best)
+
+                if isrc:
+                    return isrc, "search_ok", matched_mbid, score
+
+                return None, "search_no_isrc", matched_mbid, score
+
+            if r.status_code == 503:
+                if attempt < max_retries:
+                    wait_time = 2 * (attempt + 1)
+                    print(
+                        f"[SEARCH] status=503 artist='{artist}' track='{track}' | "
+                        f"retry {attempt + 1}/{max_retries} in {wait_time}s"
+                    )
+                    time.sleep(wait_time)
+                    continue
+                return None, "rate_limited_503", None, None
+
+            print(f"[SEARCH] status={r.status_code} artist='{artist}' track='{track}'")
+            return None, "search_request_exception", None, None
+
+        except Exception as e:
+            print(f"[SEARCH] error artist='{artist}' track='{track}': {e}")
+            if attempt < max_retries:
+                wait_time = 2 * (attempt + 1)
+                time.sleep(wait_time)
+                continue
+            return None, "search_request_exception", None, None
+
+    return None, "search_request_exception", None, None
+
+
+def flush_batch(
+    batch_rows: list,
+    batch_number: int,
+    stats: dict,
+) -> list:
+    if not batch_rows:
+        return []
+
+    df_batch = pd.DataFrame(batch_rows)
+
+    # Safety dedup by original input MBID
+    df_batch = df_batch.drop_duplicates(
+        subset=["lastfm_track_mbid"], keep="last"
     ).reset_index(drop=True)
-    print(f"After dedup artist-track-mbid: {len(df_tracks)} rows")
 
-    if TEST_MODE:
-        df_tracks = build_test_set(df_tracks, TEST_SIZE)
-        print(f"TEST MODE enabled: using {len(df_tracks)} rows")
-        print(f"Rows with MBID: {df_tracks['lastfm_track_mbid'].notna().sum()}")
+    temporal_object = (
+        f"bronze/temporal/musicbrainz/"
+        f"run_date={run_date}/run_id={run_id}/"
+        f"musicbrainz_isrc_batch_{batch_number:05d}.csv"
+    )
+    upload_csv_to_minio(df_batch, MINIO_BUCKET, temporal_object)
 
-    if TEST_MODE and os.path.exists(OUTPUT_PATH):
-        os.remove(OUTPUT_PATH)
-        print(f"Removed previous test output: {OUTPUT_PATH}")
+    append_to_delta(df_batch, ISRC_CACHE_DELTA_URI)
 
-    if os.path.exists(OUTPUT_PATH):
-        df_cache = pd.read_csv(OUTPUT_PATH)
-        print(f"Resuming from checkpoint: {len(df_cache)} rows already processed")
-    else:
-        df_cache = pd.DataFrame(columns=[
-            "lastfm_artist_name",
-            "lastfm_track_name",
-            "lastfm_track_mbid",
-            "resolution_method",
-            "resolved_mbid",
-            "isrc",
-            "mb_status"
-        ])
-
-    resolved_keys = set(
-        zip(
-            df_cache["lastfm_artist_name"],
-            df_cache["lastfm_track_name"],
-            df_cache["lastfm_track_mbid"]
-        )
+    export_full_debug_csv_local(
+        ISRC_CACHE_DELTA_URI,
+        "musicbrainz_isrc_debug.csv"
     )
 
-    to_process = [
-        row for _, row in df_tracks.iterrows()
-        if (
-            safe_str(row["lastfm_artist_name"]),
-            safe_str(row["lastfm_track_name"]),
-            safe_str(row["lastfm_track_mbid"])
-        ) not in resolved_keys
-    ]
+    print(
+        f"Checkpoint saved. Batch {batch_number} | "
+        f"rows in batch: {len(df_batch)} | "
+        f"temporal: s3://{MINIO_BUCKET}/{temporal_object}"
+    )
+    print("Current status counts:")
+    for k, v in stats.items():
+        print(f"  {k}: {v}")
 
-    print(f"Tracks to process: {len(to_process)}")
+    return []
 
-    new_rows = []
+
+# -----------------------------
+# Main
+# -----------------------------
+def main():
+    print(f"Run ID: {run_id}")
+    print(f"Run date: {run_date}")
+    print(f"Loading Last.fm tracks from: {LASTFM_TRACKS_DELTA_URI}")
+
+    df_tracks = load_delta_as_df(LASTFM_TRACKS_DELTA_URI)
+
+    required_cols = ["lastfm_track_mbid", "lastfm_artist_name", "lastfm_track_name"]
+    missing = [c for c in required_cols if c not in df_tracks.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in tracks_delta: {missing}")
+
+    df_tracks["lastfm_track_mbid"] = df_tracks["lastfm_track_mbid"].apply(safe_str)
+    df_tracks = df_tracks[df_tracks["lastfm_track_mbid"] != ""].copy()
+
+    df_tracks = df_tracks.drop_duplicates(subset=["lastfm_track_mbid"]).reset_index(drop=True)
+    print(f"Tracks with usable MBID: {len(df_tracks)}")
+
+    if delta_table_exists(ISRC_CACHE_DELTA_URI):
+        df_cache = load_delta_as_df(ISRC_CACHE_DELTA_URI)
+        print(f"Existing ISRC cache rows: {len(df_cache)}")
+    else:
+        df_cache = pd.DataFrame(columns=[
+            "lastfm_track_mbid",
+            "lastfm_artist_name",
+            "lastfm_track_name",
+            "resolution_method",
+            "matched_recording_mbid",
+            "search_score",
+            "resolved_mbid",
+            "isrc",
+            "mb_status",
+            "resolved_at_utc",
+            "run_id",
+            "run_date",
+        ])
+        print("ISRC cache does not exist yet. It will be created.")
+
+    resolved_mbids = (
+        set(df_cache["lastfm_track_mbid"].astype(str).str.strip())
+        if not df_cache.empty and "lastfm_track_mbid" in df_cache.columns
+        else set()
+    )
+
+    df_to_process = df_tracks[
+        ~df_tracks["lastfm_track_mbid"].isin(resolved_mbids)
+    ].copy().reset_index(drop=True)
+
+    print(f"MBIDs to process this run: {len(df_to_process)}")
+
     stats = {
         "ok": 0,
         "no_isrc": 0,
@@ -188,69 +423,106 @@ def main():
         "rate_limited_503": 0,
         "other_http_error": 0,
         "request_exception": 0,
-        "invalid_mbid": 0
+        "invalid_mbid": 0,
+        "search_ok": 0,
+        "search_no_isrc": 0,
+        "search_no_match": 0,
+        "search_request_exception": 0,
     }
 
-    for i, row in enumerate(to_process):
-        artist = safe_str(row["lastfm_artist_name"])
-        track = safe_str(row["lastfm_track_name"])
-        mbid = safe_str(row["lastfm_track_mbid"])
+    batch_rows = []
+    batch_number = 0
 
-        if i % 50 == 0 and i > 0:
-            print(f"{i}/{len(to_process)} processed...")
-            pd.concat([df_cache, pd.DataFrame(new_rows)], ignore_index=True).to_csv(
-                OUTPUT_PATH, index=False
+    try:
+        for i, row in df_to_process.iterrows():
+            artist = safe_str(row.get("lastfm_artist_name"))
+            track = safe_str(row.get("lastfm_track_name"))
+            mbid = safe_str(row.get("lastfm_track_mbid"))
+
+            isrc, mb_status, matched_mbid = get_isrc_from_recording_mbid(mbid)
+            search_score = None
+            resolution_method = None
+
+            if isrc:
+                resolution_method = "mbid"
+                stats[mb_status] += 1
+
+            else:
+                # keep direct MBID statuses in stats too
+                stats[mb_status] += 1
+
+                if mb_status == "not_found_404":
+                    search_isrc, search_status, search_mbid, search_score = search_recording_and_get_isrc(
+                        artist=artist,
+                        track=track,
+                    )
+                    stats[search_status] = stats.get(search_status, 0) + 1
+
+                    if search_isrc:
+                        isrc = search_isrc
+                        matched_mbid = search_mbid
+                        resolution_method = "search"
+                        mb_status = search_status
+                    else:
+                        matched_mbid = search_mbid
+                        resolution_method = f"mbid_then_{search_status}"
+                        mb_status = search_status
+                else:
+                    resolution_method = f"mbid_{mb_status}"
+
+            batch_rows.append({
+                "lastfm_track_mbid": mbid,              # original input MBID from Last.fm
+                "lastfm_artist_name": artist,
+                "lastfm_track_name": track,
+                "resolution_method": resolution_method,
+                "matched_recording_mbid": matched_mbid, # MBID actually matched in MB
+                "search_score": search_score,
+                "resolved_mbid": mbid,                  # kept for compatibility/readability
+                "isrc": isrc,
+                "mb_status": mb_status,
+                "resolved_at_utc": datetime.now(timezone.utc).isoformat(),
+                "run_id": run_id,
+                "run_date": run_date,
+            })
+
+            print(
+                f"[{i + 1}/{len(df_to_process)}] "
+                f"artist='{artist}' | track='{track}' | "
+                f"input_mbid={mbid} | method={resolution_method} | "
+                f"matched_mbid={matched_mbid} | score={search_score} | isrc={isrc}"
             )
 
-        isrc, mb_status = get_isrc_from_mbid(mbid)
-        stats[mb_status] = stats.get(mb_status, 0) + 1
+            if len(batch_rows) >= CHECKPOINT_EVERY:
+                batch_number += 1
+                batch_rows = flush_batch(batch_rows, batch_number, stats)
 
-        if isrc:
-            resolution_method = "mbid"
-        else:
-            resolution_method = f"mbid_{mb_status}"
+            time.sleep(MB_SLEEP)
 
-        new_rows.append({
-            "lastfm_artist_name": artist,
-            "lastfm_track_name": track,
-            "lastfm_track_mbid": mbid,
-            "resolution_method": resolution_method,
-            "resolved_mbid": mbid,
-            "isrc": isrc,
-            "mb_status": mb_status
-        })
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Flushing remaining batch before exit...")
+        if batch_rows:
+            batch_number += 1
+            batch_rows = flush_batch(batch_rows, batch_number, stats)
+        print("Partial progress saved.")
+        return
 
-        print(
-            f"[{i + 1}/{len(to_process)}] "
-            f"artist='{artist}' | track='{track}' | "
-            f"method={resolution_method} | isrc={isrc}"
-        )
-
-        time.sleep(MB_SLEEP)
-
-    df_final = pd.concat([df_cache, pd.DataFrame(new_rows)], ignore_index=True)
-
-    # Final deduplication in case of reruns/checkpoints
-    df_final = df_final.drop_duplicates(
-        subset=["lastfm_artist_name", "lastfm_track_name", "lastfm_track_mbid"],
-        keep="last"
-    ).reset_index(drop=True)
-
-    df_final.to_csv(OUTPUT_PATH, index=False)
+    if batch_rows:
+        batch_number += 1
+        batch_rows = flush_batch(batch_rows, batch_number, stats)
 
     print("\nDone.")
-    print(f"Total processed: {len(df_final)}")
-    print(f"ISRC found: {df_final['isrc'].notna().sum()}")
-    print(f"Missing ISRC: {df_final['isrc'].isna().sum()}")
+    print(f"Processed MBIDs this run: {len(df_to_process)}")
 
-    print("\nMusicBrainz status counts:")
+    print("\nFinal MusicBrainz status counts:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
-    print("\nResolution method counts:")
-    print(df_final["resolution_method"].value_counts(dropna=False))
-
-    print(f"\nSaved to: {OUTPUT_PATH}")
+    print("\nFinal debug CSV exported locally: musicbrainz_isrc_debug.csv")
+    print(f"Persistent Delta in MinIO: {ISRC_CACHE_DELTA_URI}")
+    print(
+        f"Temporal CSV batches in MinIO: "
+        f"s3://{MINIO_BUCKET}/bronze/temporal/musicbrainz/run_date={run_date}/run_id={run_id}/"
+    )
 
 
 if __name__ == "__main__":
